@@ -53,11 +53,18 @@ class Searcher:
     Args:
         store: Initialized MemoryStore.
         embed_client: Initialized EmbeddingClient.
+        wiki_bridge: Optional WikiBridge for cross-knowledge-base search.
     """
 
-    def __init__(self, store: MemoryStore, embed_client: EmbeddingClient) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        embed_client: EmbeddingClient,
+        wiki_bridge=None,
+    ) -> None:
         self._store = store
         self._embed = embed_client
+        self._wiki = wiki_bridge
 
     # ═══════════════════════════════════════════════════════════════════
     # Public API
@@ -68,7 +75,7 @@ class Searcher:
         query: str,
         top_k: int = 10,
         *,
-        paths: tuple[str, ...] = ("fts5", "vector", "graph"),
+        paths: tuple[str, ...] = ("fts5", "vector", "graph", "wiki"),
     ) -> list[Engram]:
         """Search engrams via configured paths, fuse with RRF.
 
@@ -102,6 +109,10 @@ class Searcher:
         if "graph" in paths:
             tasks.append(asyncio.create_task(
                 _run_path("graph", self._graph_search(query, top_k * 3)),
+            ))
+        if "wiki" in paths and self._wiki is not None:
+            tasks.append(asyncio.create_task(
+                _run_path("wiki", self._wiki_search(query, top_k * 3)),
             ))
 
         if tasks:
@@ -316,6 +327,39 @@ class Searcher:
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Path 4: Wiki-rag knowledge base search (cross-island bridge)
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _wiki_search(self, query: str, top_k: int) -> list[tuple[Engram, float]]:
+        """Query the wiki-rag knowledge base and return as pseudo-engrams.
+
+        Wiki results participate in RRF fusion alongside engram results.
+        Uses ``asyncio.to_thread`` since sqlite3 is synchronous.
+        """
+        import asyncio
+        from hermes_memory.models import Engram
+
+        wiki_results = await asyncio.to_thread(self._wiki.search, query, top_k)
+        now_ms = int(time.time() * 1000)
+        engram_results: list[tuple[Engram, float]] = []
+        for wr in wiki_results:
+            # Create a pseudo-engram from wiki result
+            eng = Engram(
+                id=f"wiki:{wr.doc_id}",
+                statement=wr.excerpt,
+                content_hash=f"wiki:{wr.doc_id}",
+                domain="reference",
+                agent="wiki-rag",
+                source="imported",
+                created_at=now_ms,
+                last_accessed_at=now_ms,
+                tags=list(wr.tags),
+                commitment="decided",
+            )
+            engram_results.append((eng, wr.score))
+        return engram_results
 
     # ═══════════════════════════════════════════════════════════════════
     # RRF Fusion (Reciprocal Rank Fusion)
